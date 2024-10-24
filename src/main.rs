@@ -207,3 +207,122 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use super::*;
+
+    #[test]
+    fn test_get_paths() {
+        let paths = vec!["P\tp1\t1+, 2-, 3+", "P\tp2\t2+, 4-", "P\tp3\t5-, 3-, 1+"];
+        let paths_to_keep = vec!["p2".to_string(), "p3".to_string()];
+        let calculated = get_paths(paths, paths_to_keep);
+        let expected = vec!["P\tp2\t2+, 4-".to_string(), "P\tp3\t5-, 3-, 1+".to_string()];
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_of_paths() {
+        let paths = vec![
+            "P\tp1\t1+, 2-, 3+".to_string(),
+            "P\tp2\t2+, 4-".to_string(),
+            "P\tp3\t5-, 3-, 1+".to_string(),
+        ];
+        let expected = vec![
+            vec![
+                ("1".to_string(), true),
+                ("2".to_string(), false),
+                ("3".to_string(), true),
+            ],
+            vec![("2".to_string(), true), ("4".to_string(), false)],
+            vec![
+                ("5".to_string(), false),
+                ("3".to_string(), false),
+                ("1".to_string(), true),
+            ],
+        ];
+        let calculated = get_nodes_of_paths(&paths);
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_segments_to_keep() {
+        let nodes_of_paths = vec![
+            vec![
+                ("1".to_string(), true),
+                ("2".to_string(), false),
+                ("3".to_string(), true),
+            ],
+            vec![("2".to_string(), true), ("4".to_string(), false)],
+            vec![
+                ("5".to_string(), false),
+                ("3".to_string(), false),
+                ("1".to_string(), true),
+            ],
+        ];
+        let expected = HashSet::from([
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string(),
+        ]);
+        let calculated = get_segments_to_keep(&nodes_of_paths);
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_filter_segments() {
+        let segments = vec!["S\t1\tTCCGAT", "S\t2\tTA", "S\t3\tACG"];
+        let nodes = HashSet::from(["1".to_string(), "2".to_string()]);
+        let expected = vec!["S\t1\tTCCGAT", "S\t2\tTA"];
+        let calculated = filter_segments(segments, nodes);
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_links_to_keep() {
+        let nodes_of_paths = vec![
+            vec![
+                ("1".to_string(), true),
+                ("2".to_string(), false),
+                ("3".to_string(), true),
+            ],
+            vec![("2".to_string(), true), ("4".to_string(), false)],
+            vec![
+                ("5".to_string(), false),
+                ("3".to_string(), false),
+                ("1".to_string(), true),
+            ],
+        ];
+        let expected = HashSet::from([
+            (("1".to_string(), true), ("2".to_string(), false)),
+            (("2".to_string(), false), ("3".to_string(), true)),
+            (("2".to_string(), true), ("4".to_string(), false)),
+            (("5".to_string(), false), ("3".to_string(), false)),
+            (("3".to_string(), false), ("1".to_string(), true)),
+        ]);
+        let calculated = get_links_to_keep(nodes_of_paths);
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_filter_links() {
+        let links = vec![
+            "L\t2\t-\t1\t+",
+            "L\t2\t-\t3\t+",
+            "L\t2\t-\t4\t+",
+            "L\t5\t-\t4\t+",
+        ];
+        let links_to_keep = HashSet::from([
+            (("1".to_string(), true), ("2".to_string(), false)),
+            (("2".to_string(), false), ("3".to_string(), true)),
+            (("2".to_string(), true), ("4".to_string(), false)),
+            (("5".to_string(), false), ("3".to_string(), false)),
+        ]);
+        let expected = vec!["L\t2\t-\t1\t+", "L\t2\t-\t3\t+"];
+        let calculated = filter_links(links, links_to_keep);
+        assert_eq!(calculated, expected);
+    }
+}
