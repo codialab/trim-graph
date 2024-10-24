@@ -314,6 +314,7 @@ dependencies = [
  "itertools",
  "log",
  "rayon",
+ "regex",
 ]
 
 [[package]]

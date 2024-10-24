@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io::Write;
+use regex::Regex;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -53,8 +54,9 @@ fn get_paths(paths: Vec<&str>, paths_to_keep: Vec<String>) -> Vec<String> {
     paths
 }
 
-fn get_nodes_of_paths(paths: &Vec<String>) -> Vec<Vec<(String, bool)>> {
-    paths
+fn get_nodes_of_paths_walks(paths: &Vec<String>, walks: &Vec<String>) -> Vec<Vec<(String, bool)>> {
+    let regex = Regex::new(r"([><])([!-;=?-~]+)").unwrap(); 
+    let mut paths_walks = paths
         .par_iter()
         .map(|p| {
             p.split('\t')
@@ -70,7 +72,15 @@ fn get_nodes_of_paths(paths: &Vec<String>) -> Vec<Vec<(String, bool)>> {
                 })
                 .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    paths_walks.append(&mut walks
+        .par_iter()
+        .map(|w| {
+            let w_line = w.split('\t').nth(6).unwrap();
+            regex.captures_iter(w_line).map(|caps| (caps[2].to_string(), &caps[1] == ">")).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>());
+    paths_walks
 }
 
 fn get_segments_to_keep(nodes_of_paths: &Vec<Vec<(String, bool)>>) -> HashSet<String> {
@@ -146,8 +156,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut segments = Vec::new();
     let mut paths = Vec::new();
+    let mut walks = Vec::new();
     let mut links = Vec::new();
     let mut headers = Vec::new();
+    let mut others = Vec::new();
     for line in graph {
         if line.starts_with('S') {
             segments.push(line);
@@ -155,8 +167,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             links.push(line);
         } else if line.starts_with('P') {
             paths.push(line);
+        } else if line.starts_with('W'){
+            walks.push(line);
         } else if line.starts_with('H') {
             headers.push(line);
+        } else {
+            others.push(line);
         }
     }
 
@@ -178,16 +194,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let paths = get_paths(paths, paths_to_keep);
+    let walks = walks.into_par_iter().map(|s| s.to_string()).collect();
 
     log::info!("Getting nodes to keep");
-    let nodes_of_paths = get_nodes_of_paths(&paths);
-    let nodes_to_keep = get_segments_to_keep(&nodes_of_paths);
+    let nodes_of_paths_walks = get_nodes_of_paths_walks(&paths, &walks);
+    let nodes_to_keep = get_segments_to_keep(&nodes_of_paths_walks);
 
     log::info!("Removing nodes");
     let segments = filter_segments(segments, nodes_to_keep);
 
     log::info!("Getting edges to keep");
-    let edges_to_keep = get_links_to_keep(nodes_of_paths);
+    let edges_to_keep = get_links_to_keep(nodes_of_paths_walks);
 
     log::info!("Removing edges");
     let links = filter_links(links, edges_to_keep);
@@ -202,8 +219,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     for p in paths {
         writeln!(out, "{}", p)?;
     }
+    for w in walks {
+        writeln!(out, "{}", w)?;
+    }
     for l in links {
         writeln!(out, "{}", l)?;
+    }
+    for o in others {
+        writeln!(out, "{}", o)?;
     }
     Ok(())
 }
@@ -242,7 +265,30 @@ mod tests {
                 ("1".to_string(), true),
             ],
         ];
-        let calculated = get_nodes_of_paths(&paths);
+        let calculated = get_nodes_of_paths_walks(&paths, &Vec::new());
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_of_walks() {
+        let walks = vec![
+            "W\tNA12878\t1\tchr1\t0\t11\t>s11<s12>s13".to_string(),
+            "W\tNA12878\t1\tchr1\t0\t11\t<s112<s12s>s13<s11".to_string(),
+        ];
+        let expected = vec![
+            vec![
+                ("s11".to_string(), true),
+                ("s12".to_string(), false),
+                ("s13".to_string(), true),
+            ],
+            vec![
+                ("s112".to_string(), false),
+                ("s12s".to_string(), false),
+                ("s13".to_string(), true),
+                ("s11".to_string(), false),
+            ],
+        ];
+        let calculated = get_nodes_of_paths_walks(&Vec::new(), &walks);
         assert_eq!(calculated, expected);
     }
 

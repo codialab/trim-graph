@@ -12,3 +12,4 @@ clap = { version = "4.5.20", features = ["derive", "cargo"] }
 # Logging and error management
 log        = "0.4"
 env_logger = "0.10"
+regex = "1.11.0"
