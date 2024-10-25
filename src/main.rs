@@ -27,6 +27,18 @@ struct Params {
     /// Sets the number of threads for trim-graph to use
     #[arg(short, long)]
     threads: Option<usize>,
+
+    /// Do not remove any segment lines
+    #[arg(short = 'S', long)]
+    ignore_segments: bool,
+
+    /// Do not remove any link lines
+    #[arg(short = 'L', long)]
+    ignore_links: bool,
+
+    /// Do not remove any jump lines
+    #[arg(short = 'J', long)]
+    ignore_jumps: bool,
 }
 
 fn set_number_of_threads(params: &Params) {
@@ -230,14 +242,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     log::info!("Getting nodes/edges to keep");
     let (nodes, links, jumps) = get_nodes_edges(&paths, &walks);
 
-    log::info!("Removing nodes");
-    let segments = filter_segments(segments, nodes);
+    let segments = match params.ignore_segments {
+        false => {
+            log::info!("Removing nodes");
+            filter_segments(segments, nodes)
+        }
+        true => segments,
+    };
 
-    log::info!("Removing links");
-    let link_lines = filter_edges(link_lines, links);
+    let link_lines = match params.ignore_links {
+        false => {
+            log::info!("Removing links");
+            filter_edges(link_lines, links)
+        }
+        true => link_lines,
+    };
 
-    log::info!("Removing jumps");
-    let jump_lines = filter_edges(jump_lines, jumps);
+    let jump_lines = match params.ignore_jumps {
+        false => {
+            log::info!("Removing jumps");
+            filter_edges(jump_lines, jumps)
+        }
+        true => jump_lines,
+    };
 
     let mut out = std::io::BufWriter::new(std::io::stdout());
     for h in headers {
