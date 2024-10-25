@@ -1,12 +1,18 @@
 use clap::Parser;
 use itertools::Itertools;
+use lazy_static::lazy_static;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use regex::Regex;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
+use std::hash::Hash;
 use std::io::Write;
-use regex::Regex;
+
+lazy_static! {
+    static ref RE: Regex = Regex::new(r"([><])([!-;=?-~]+)").unwrap();
+}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -54,50 +60,88 @@ fn get_paths(paths: Vec<&str>, paths_to_keep: Vec<String>) -> Vec<String> {
     paths
 }
 
-fn get_nodes_of_paths_walks(paths: &Vec<String>, walks: &Vec<String>) -> Vec<Vec<(String, bool)>> {
-    let regex = Regex::new(r"([><])([!-;=?-~]+)").unwrap(); 
-    let mut paths_walks = paths
+type SortedNodes = Vec<String>;
+type SortedEdges = Vec<((String, bool), (String, bool))>;
+type Nodes = HashSet<String>;
+type Edges = HashSet<((String, bool), (String, bool))>;
+
+fn flatten_into_hashset<T: Eq + Hash + Send + Sync + Clone>(v: Vec<Vec<T>>) -> HashSet<T> {
+    v.into_par_iter()
+        .map(|row| HashSet::from_iter(row.iter().cloned()))
+        .reduce(HashSet::new, |acc: HashSet<T>, set| {
+            acc.union(&set).cloned().collect()
+        })
+}
+
+fn get_nodes_edges_from_path(path: &str) -> (SortedNodes, SortedEdges, SortedEdges) {
+    let node_texts = path.split_inclusive(&[',', ';']);
+    let mut nodes: Vec<(String, bool)> = Vec::new();
+    let mut links: SortedEdges = Vec::new();
+    let mut jumps: SortedEdges = Vec::new();
+    for node_text in node_texts.rev() {
+        let node_text = node_text.trim();
+        let node = node_text.replace(['+', '-', ',', ';'], "");
+        let is_jump = if node_text.ends_with(';') {
+            Some(true)
+        } else if node_text.ends_with(',') {
+            Some(false)
+        } else {
+            None
+        };
+        let orientation = if is_jump.is_some() {
+            node_text[..node_text.len() - 1].ends_with('+')
+        } else {
+            node_text[..node_text.len()].ends_with('+')
+        };
+        println!("{} - {} - {:?}", node, orientation, is_jump);
+
+        if let Some(prev_node) = nodes.last() {
+            if is_jump.expect("All nodes before last should have separator") {
+                jumps.push(((node.clone(), orientation), prev_node.clone()));
+            } else {
+                links.push(((node.clone(), orientation), prev_node.clone()));
+            }
+        }
+        nodes.push((node, orientation));
+    }
+    let nodes = nodes.into_iter().map(|(s, _)| s).collect();
+    (nodes, links, jumps)
+}
+
+fn get_nodes_edges_from_walk(walk: &str) -> (SortedNodes, SortedEdges) {
+    let full_nodes = RE
+        .captures_iter(walk)
+        .map(|caps| (caps[2].to_string(), &caps[1] == ">"))
+        .collect::<Vec<_>>();
+    let nodes = full_nodes.iter().cloned().map(|(s, _)| s).collect();
+    let links = full_nodes.into_iter().tuple_windows().collect();
+    (nodes, links)
+}
+
+fn get_nodes_edges(paths: &Vec<String>, walks: &Vec<String>) -> (Nodes, Edges, Edges) {
+    let (nodes, (links, jumps)): (Vec<SortedNodes>, (Vec<SortedEdges>, Vec<SortedEdges>)) = paths
         .par_iter()
         .map(|p| {
-            p.split('\t')
-                .nth(2)
-                .unwrap()
-                .split(',')
-                .map(|s| {
-                    let trimmed = s.trim();
-                    (
-                        trimmed[..trimmed.len() - 1].to_string(),
-                        trimmed.ends_with('+'),
-                    )
-                })
-                .collect::<Vec<_>>()
+            let path = p.split('\t').nth(2).unwrap();
+            let (nodes, links, jumps) = get_nodes_edges_from_path(path);
+            (nodes, (links, jumps))
         })
-        .collect::<Vec<_>>();
-    paths_walks.append(&mut walks
+        .unzip();
+    let mut nodes = flatten_into_hashset(nodes);
+    let mut links = flatten_into_hashset(links);
+    let jumps = flatten_into_hashset(jumps);
+    let (walk_nodes, walk_links): (Vec<SortedNodes>, Vec<SortedEdges>) = walks
         .par_iter()
         .map(|w| {
             let w_line = w.split('\t').nth(6).unwrap();
-            regex.captures_iter(w_line).map(|caps| (caps[2].to_string(), &caps[1] == ">")).collect::<Vec<_>>()
+            get_nodes_edges_from_walk(w_line)
         })
-        .collect::<Vec<_>>());
-    paths_walks
-}
-
-fn get_segments_to_keep(nodes_of_paths: &Vec<Vec<(String, bool)>>) -> HashSet<String> {
-    nodes_of_paths
-        .par_iter()
-        .map(|nodes| {
-            HashSet::from_iter::<HashSet<String>>(
-                nodes
-                    .clone()
-                    .into_iter()
-                    .unzip::<String, bool, HashSet<String>, HashSet<bool>>()
-                    .0,
-            )
-        })
-        .reduce(HashSet::new, |acc: HashSet<String>, set| {
-            acc.union(&set).map(|s| s.to_string()).collect()
-        })
+        .unzip();
+    let walk_nodes = flatten_into_hashset(walk_nodes);
+    let walk_links = flatten_into_hashset(walk_links);
+    nodes.extend(walk_nodes);
+    links.extend(walk_links);
+    (nodes, links, jumps)
 }
 
 fn filter_segments(segments: Vec<&str>, nodes_to_keep: HashSet<String>) -> Vec<&str> {
@@ -109,23 +153,7 @@ fn filter_segments(segments: Vec<&str>, nodes_to_keep: HashSet<String>) -> Vec<&
         .collect::<Vec<_>>()
 }
 
-fn get_links_to_keep(
-    nodes_of_paths: Vec<Vec<(String, bool)>>,
-) -> HashSet<((String, bool), (String, bool))> {
-    nodes_of_paths
-        .into_par_iter()
-        .map(|p| p.into_iter().tuple_windows().collect::<HashSet<(_, _)>>())
-        .reduce(HashSet::new, |acc, set| {
-            acc.union(&set)
-                .map(|s| (s.0.to_owned(), s.1.to_owned()))
-                .collect()
-        })
-}
-
-fn filter_links(
-    links: Vec<&str>,
-    edges_to_keep: HashSet<((String, bool), (String, bool))>,
-) -> Vec<&str> {
+fn filter_edges(links: Vec<&str>, edges_to_keep: Edges) -> Vec<&str> {
     links
         .into_par_iter()
         .filter(|l| {
@@ -157,18 +185,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut segments = Vec::new();
     let mut paths = Vec::new();
     let mut walks = Vec::new();
-    let mut links = Vec::new();
+    let mut link_lines = Vec::new();
+    let mut jump_lines = Vec::new();
     let mut headers = Vec::new();
     let mut others = Vec::new();
     for line in graph {
         if line.starts_with('S') {
             segments.push(line);
         } else if line.starts_with('L') {
-            links.push(line);
+            link_lines.push(line);
         } else if line.starts_with('P') {
             paths.push(line);
-        } else if line.starts_with('W'){
+        } else if line.starts_with('W') {
             walks.push(line);
+        } else if line.starts_with('J') {
+            jump_lines.push(line);
         } else if line.starts_with('H') {
             headers.push(line);
         } else {
@@ -196,18 +227,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let paths = get_paths(paths, paths_to_keep);
     let walks = walks.into_par_iter().map(|s| s.to_string()).collect();
 
-    log::info!("Getting nodes to keep");
-    let nodes_of_paths_walks = get_nodes_of_paths_walks(&paths, &walks);
-    let nodes_to_keep = get_segments_to_keep(&nodes_of_paths_walks);
+    log::info!("Getting nodes/edges to keep");
+    let (nodes, links, jumps) = get_nodes_edges(&paths, &walks);
 
     log::info!("Removing nodes");
-    let segments = filter_segments(segments, nodes_to_keep);
+    let segments = filter_segments(segments, nodes);
 
-    log::info!("Getting edges to keep");
-    let edges_to_keep = get_links_to_keep(nodes_of_paths_walks);
+    log::info!("Removing links");
+    let link_lines = filter_edges(link_lines, links);
 
-    log::info!("Removing edges");
-    let links = filter_links(links, edges_to_keep);
+    log::info!("Removing jumps");
+    let jump_lines = filter_edges(jump_lines, jumps);
 
     let mut out = std::io::BufWriter::new(std::io::stdout());
     for h in headers {
@@ -222,8 +252,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     for w in walks {
         writeln!(out, "{}", w)?;
     }
-    for l in links {
+    for l in link_lines {
         writeln!(out, "{}", l)?;
+    }
+    for j in jump_lines {
+        writeln!(out, "{}", j)?;
     }
     for o in others {
         writeln!(out, "{}", o)?;
@@ -246,75 +279,113 @@ mod tests {
     }
 
     #[test]
-    fn test_get_nodes_of_paths() {
-        let paths = vec![
-            "P\tp1\t1+, 2-, 3+".to_string(),
-            "P\tp2\t2+, 4-".to_string(),
-            "P\tp3\t5-, 3-, 1+".to_string(),
-        ];
-        let expected = vec![
-            vec![
-                ("1".to_string(), true),
-                ("2".to_string(), false),
-                ("3".to_string(), true),
-            ],
-            vec![("2".to_string(), true), ("4".to_string(), false)],
-            vec![
-                ("5".to_string(), false),
-                ("3".to_string(), false),
-                ("1".to_string(), true),
-            ],
-        ];
-        let calculated = get_nodes_of_paths_walks(&paths, &Vec::new());
+    fn test_get_nodes_edges_from_path_nodes() {
+        let path = "1+, 2-, 3+";
+        let mut expected = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let (mut calculated, _, _) = get_nodes_edges_from_path(path);
+        calculated.sort();
+        expected.sort();
         assert_eq!(calculated, expected);
     }
 
     #[test]
-    fn test_get_nodes_of_walks() {
+    fn test_get_nodes_edges_from_path_links() {
+        let path = "1+, 2-; 3+, 2+";
+        let mut expected = vec![
+            (("1".to_string(), true), ("2".to_string(), false)),
+            (("3".to_string(), true), ("2".to_string(), true)),
+        ];
+        let (_, mut calculated, _) = get_nodes_edges_from_path(path);
+        calculated.sort();
+        expected.sort();
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_edges_from_path_jumps() {
+        let path = "1+; 2-, 3+; 2+";
+        let mut expected = vec![
+            (("1".to_string(), true), ("2".to_string(), false)),
+            (("3".to_string(), true), ("2".to_string(), true)),
+        ];
+        let (_, _, mut calculated) = get_nodes_edges_from_path(path);
+        calculated.sort();
+        expected.sort();
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_node_edges_for_paths() {
+        let paths = vec!["P\tp1\t1+, 2-; 3+".to_string(), "P\tp2\t2+, 4-".to_string()];
+        let expected = (
+            HashSet::from([
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+            ]),
+            HashSet::from([
+                (("1".to_string(), true), ("2".to_string(), false)),
+                (("2".to_string(), true), ("4".to_string(), false)),
+            ]),
+            HashSet::from([(("2".to_string(), false), ("3".to_string(), true))]),
+        );
+        let calculated = get_nodes_edges(&paths, &Vec::new());
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_edges_from_walk_nodes() {
+        let walk = ">1<2>3";
+        let mut expected = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let (mut calculated, _) = get_nodes_edges_from_walk(walk);
+        expected.sort();
+        calculated.sort();
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_edges_from_walk_links() {
+        let walk = ">1<2>3";
+        let mut expected = vec![
+            (("1".to_string(), true), ("2".to_string(), false)),
+            (("2".to_string(), false), ("3".to_string(), true)),
+        ];
+        let (_, mut calculated) = get_nodes_edges_from_walk(walk);
+        expected.sort();
+        calculated.sort();
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_nodes_edges_for_walks() {
         let walks = vec![
-            "W\tNA12878\t1\tchr1\t0\t11\t>s11<s12>s13".to_string(),
-            "W\tNA12878\t1\tchr1\t0\t11\t<s112<s12s>s13<s11".to_string(),
+            "W\tNA12878\t1\tchr1\t0\t11\t>1<2>3".to_string(),
+            "W\tNA12878\t1\tchr1\t0\t11\t>2<4".to_string(),
         ];
-        let expected = vec![
-            vec![
-                ("s11".to_string(), true),
-                ("s12".to_string(), false),
-                ("s13".to_string(), true),
-            ],
-            vec![
-                ("s112".to_string(), false),
-                ("s12s".to_string(), false),
-                ("s13".to_string(), true),
-                ("s11".to_string(), false),
-            ],
-        ];
-        let calculated = get_nodes_of_paths_walks(&Vec::new(), &walks);
+        let expected = (
+            HashSet::from([
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+            ]),
+            HashSet::from([
+                (("1".to_string(), true), ("2".to_string(), false)),
+                (("2".to_string(), false), ("3".to_string(), true)),
+                (("2".to_string(), true), ("4".to_string(), false)),
+            ]),
+            HashSet::from([]),
+        );
+        let calculated = get_nodes_edges(&Vec::new(), &walks);
         assert_eq!(calculated, expected);
     }
 
     #[test]
-    fn test_get_segments_to_keep() {
-        let nodes_of_paths = vec![
-            vec![
-                ("1".to_string(), true),
-                ("2".to_string(), false),
-                ("3".to_string(), true),
-            ],
-            vec![("2".to_string(), true), ("4".to_string(), false)],
-            vec![
-                ("5".to_string(), false),
-                ("3".to_string(), false),
-                ("1".to_string(), true),
-            ],
-        ];
-        let expected = HashSet::from([
-            "1".to_string(),
-            "2".to_string(),
-            "3".to_string(),
-            "4".to_string(),
-            "5".to_string(),
-        ]);
-        let calculated = get_segments_to_keep(&nodes_of_paths);
+    fn test_flatten_into_hashset() {
+        let v = vec![vec![1, 2, 3], vec![2, 4]];
+        let expected = HashSet::from([1, 2, 3, 4]);
+        let calculated = flatten_into_hashset(v);
         assert_eq!(calculated, expected);
     }
 
@@ -324,32 +395,6 @@ mod tests {
         let nodes = HashSet::from(["1".to_string(), "2".to_string()]);
         let expected = vec!["S\t1\tTCCGAT", "S\t2\tTA"];
         let calculated = filter_segments(segments, nodes);
-        assert_eq!(calculated, expected);
-    }
-
-    #[test]
-    fn test_get_links_to_keep() {
-        let nodes_of_paths = vec![
-            vec![
-                ("1".to_string(), true),
-                ("2".to_string(), false),
-                ("3".to_string(), true),
-            ],
-            vec![("2".to_string(), true), ("4".to_string(), false)],
-            vec![
-                ("5".to_string(), false),
-                ("3".to_string(), false),
-                ("1".to_string(), true),
-            ],
-        ];
-        let expected = HashSet::from([
-            (("1".to_string(), true), ("2".to_string(), false)),
-            (("2".to_string(), false), ("3".to_string(), true)),
-            (("2".to_string(), true), ("4".to_string(), false)),
-            (("5".to_string(), false), ("3".to_string(), false)),
-            (("3".to_string(), false), ("1".to_string(), true)),
-        ]);
-        let calculated = get_links_to_keep(nodes_of_paths);
         assert_eq!(calculated, expected);
     }
 
@@ -368,7 +413,7 @@ mod tests {
             (("5".to_string(), false), ("3".to_string(), false)),
         ]);
         let expected = vec!["L\t2\t-\t1\t+", "L\t2\t-\t3\t+"];
-        let calculated = filter_links(links, links_to_keep);
+        let calculated = filter_edges(links, links_to_keep);
         assert_eq!(calculated, expected);
     }
 }
