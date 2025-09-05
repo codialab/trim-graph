@@ -39,6 +39,10 @@ struct Params {
     /// Do not remove any jump lines
     #[arg(short = 'J', long)]
     ignore_jumps: bool,
+
+    /// Induces link lines from the paths
+    #[arg(short = 'i', long)]
+    induce: bool,
 }
 
 fn set_number_of_threads(params: &Params) {
@@ -105,7 +109,7 @@ fn get_nodes_edges_from_path(path: &str) -> (SortedNodes, SortedEdges, SortedEdg
         } else {
             node_text[..node_text.len()].ends_with('+')
         };
-        println!("{} - {} - {:?}", node, orientation, is_jump);
+        //eprintln!("{} - {} - {:?}", node, orientation, is_jump);
 
         if let Some(prev_node) = nodes.last() {
             if is_jump.expect("All nodes before last should have separator") {
@@ -183,6 +187,56 @@ fn filter_edges(links: Vec<&str>, edges_to_keep: Edges) -> Vec<&str> {
         .collect::<Vec<_>>()
 }
 
+fn filter_edges_string(links: Vec<String>, edges_to_keep: Edges) -> Vec<String> {
+    links
+        .into_par_iter()
+        .filter(|l| {
+            let fields = l.split('\t').collect::<Vec<_>>();
+            let edge = (
+                (fields[1].to_string(), fields[2].contains('+')),
+                (fields[3].to_string(), fields[4].contains('+')),
+            );
+            let rev_edge = (
+                (fields[3].to_string(), fields[4].contains('+')),
+                (fields[1].to_string(), fields[2].contains('+')),
+            );
+            edges_to_keep.contains(&edge) || edges_to_keep.contains(&rev_edge)
+        })
+        .collect::<Vec<_>>()
+}
+
+fn induce_edges(links: Vec<&str>, edges_to_keep: Edges) -> Vec<String> {
+    let link_check: HashSet<&str> = links.iter().cloned().collect();
+    let edges: Vec<String> = edges_to_keep
+        .into_iter()
+        .filter_map(|e| {
+            let text = format!(
+                "L\t{}\t{}\t{}\t{}\t0M",
+                e.0 .0,
+                bto(e.0 .1),
+                e.1 .0,
+                bto(e.1 .1)
+            );
+            if link_check.contains(&text[..]) {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .collect();
+    let mut links: Vec<String> = links.into_iter().map(|s| s.to_string()).collect();
+    eprintln!("Found Edges: {:?}", edges);
+    links.extend(edges);
+    links
+}
+
+fn bto(o: bool) -> String {
+    match o {
+        true => '+'.to_string(),
+        false => '-'.to_string(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
@@ -250,10 +304,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         true => segments,
     };
 
+    let link_lines = match params.induce {
+        false => link_lines.into_iter().map(|s| s.to_string()).collect(),
+        true => {
+            log::info!("Inducing links");
+            induce_edges(link_lines, links.clone())
+        }
+    };
+
     let link_lines = match params.ignore_links {
         false => {
             log::info!("Removing links");
-            filter_edges(link_lines, links)
+            filter_edges_string(link_lines, links)
         }
         true => link_lines,
     };
