@@ -1,14 +1,17 @@
+use anyhow::anyhow;
 use clap::Parser;
+use env_logger::Env;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use regex::regex;
 use regex::Regex;
 use std::collections::HashSet;
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::Hash;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 
 lazy_static! {
     static ref RE: Regex = Regex::new(r"([><])([!-;=?-~]+)").unwrap();
@@ -59,21 +62,46 @@ fn set_number_of_threads(params: &Params) {
     );
 }
 
-fn get_paths(paths: Vec<&str>, paths_to_keep: Vec<String>) -> Vec<String> {
-    log::info!("Filtering paths");
-    let paths = paths
-        .into_par_iter()
-        .filter(|l| {
-            paths_to_keep.contains(
-                &l.split('\t')
-                    .nth(1)
-                    .expect("All paths should have names")
-                    .to_string(),
-            )
-        })
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    paths
+fn get_paths(paths: Vec<&str>, paths_to_keep: &Option<Vec<SpecifiedWalk>>) -> Vec<String> {
+    if let Some(paths_to_keep) = paths_to_keep.as_ref() {
+        log::info!("Filtering paths");
+        let paths = paths
+            .into_par_iter()
+            .filter_map(|l| {
+                let walk = Walk::try_from_path(l).ok()?;
+                if paths_to_keep.iter().any(|s| walk.matches(s)) {
+                    Some(l.to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        paths
+    } else {
+        log::info!("No path filtering done");
+        paths.into_iter().map(|s| s.to_owned()).collect()
+    }
+}
+
+fn get_walks(walks: Vec<&str>, walks_to_keep: &Option<Vec<SpecifiedWalk>>) -> Vec<String> {
+    if let Some(walks_to_keep) = walks_to_keep.as_ref() {
+        log::info!("Filtering walks");
+        let walks = walks
+            .into_par_iter()
+            .filter_map(|l| {
+                let walk = Walk::try_from_walk(l).ok()?;
+                if walks_to_keep.iter().any(|s| walk.matches(s)) {
+                    Some(l.to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        walks
+    } else {
+        log::info!("No path filtering done");
+        walks.into_iter().map(|s| s.to_owned()).collect()
+    }
 }
 
 type SortedNodes = Vec<String>;
@@ -238,7 +266,7 @@ fn bto(o: bool) -> String {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let params = Params::parse();
 
@@ -273,25 +301,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let paths_to_keep = match params.paths_to_keep {
-        Some(path_file) => {
-            let contents =
-                fs::read_to_string(path_file).expect("Should have been able to read the file");
-            contents.lines().map(|s| s.to_string()).collect::<Vec<_>>()
-        }
-        None => paths
-            .par_iter()
-            .map(|l| {
-                l.split('\t')
-                    .nth(1)
-                    .expect("All paths should have names")
-                    .to_string()
-            })
-            .collect(),
-    };
+    let paths_to_keep: Option<anyhow::Result<Vec<SpecifiedWalk>>> =
+        params.paths_to_keep.map(|file_name| {
+            let file = File::open(file_name)?;
+            let reader = BufReader::new(file);
+            let mut paths: Vec<SpecifiedWalk> = Vec::new();
+            for line in reader.lines() {
+                paths.push((&line?[..]).try_into()?);
+            }
+            Ok(paths)
+        });
+    let paths_to_keep = paths_to_keep.map_or(Ok(None), |v| v.map(Some))?;
 
-    let paths = get_paths(paths, paths_to_keep);
-    let walks = walks.into_par_iter().map(|s| s.to_string()).collect();
+    let paths = get_paths(paths, &paths_to_keep);
+    let walks = get_walks(walks, &paths_to_keep);
 
     log::info!("Getting nodes/edges to keep");
     let (nodes, links, jumps) = get_nodes_edges(&paths, &walks);
@@ -353,6 +376,134 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum SpecifiedWalk {
+    SampleLevel(String),
+    HaplotypeLevel(String, u16),
+    SequenceLevel(String, u16, String),
+    CoordLevel(String, u16, String, usize, usize),
+}
+
+#[derive(Debug)]
+struct Walk {
+    sample: String,
+    haplotype: u16,
+    sequence: String,
+    start: Option<usize>,
+    end: Option<usize>,
+}
+
+impl Walk {
+    fn try_from_path(path: &str) -> anyhow::Result<Self> {
+        let caps = regex!(r"^P\t([^#]+)#(\d+)#([^#:]+)(:(\d+)-(\d+))?\t")
+            .captures(path)
+            .ok_or(anyhow!("Path line is not a valid path line"))?;
+        let sample = caps[1].to_owned();
+        let haplotype: u16 = caps[2].parse()?;
+        let sequence = caps[3].to_owned();
+        let start: anyhow::Result<Option<usize>> = caps
+            .get(5)
+            .map_or(Ok(None), |v| Ok(Some(v.as_str().parse()?)));
+        let start = start?;
+        let end: anyhow::Result<Option<usize>> = caps
+            .get(6)
+            .map_or(Ok(None), |v| Ok(Some(v.as_str().parse()?)));
+        let end = end?;
+        Ok(Self {
+            sample,
+            haplotype,
+            sequence,
+            start,
+            end,
+        })
+    }
+
+    fn try_from_walk(walk: &str) -> anyhow::Result<Self> {
+        let caps = regex!(r"^W\t([^\t]+)\t(\d+)\t([^\t]+)\t([0-9*]+)\t([0-9*]+)\t")
+            .captures(walk)
+            .ok_or(anyhow!("Walk line is not a valid walk line"))?;
+        let sample = caps[1].to_owned();
+        let haplotype: u16 = caps[2].parse()?;
+        let sequence = caps[3].to_owned();
+        let start: anyhow::Result<Option<usize>> = caps.get(4).map_or(Ok(None), |v| {
+            let v = v.as_str();
+            if v == "*" {
+                Ok(None)
+            } else {
+                Ok(Some(v.parse()?))
+            }
+        });
+        let start = start?;
+        let end: anyhow::Result<Option<usize>> = caps.get(5).map_or(Ok(None), |v| {
+            let v = v.as_str();
+            if v == "*" {
+                Ok(None)
+            } else {
+                Ok(Some(v.parse()?))
+            }
+        });
+        let end = end?;
+        Ok(Self {
+            sample,
+            haplotype,
+            sequence,
+            start,
+            end,
+        })
+    }
+
+    fn matches(&self, specified: &SpecifiedWalk) -> bool {
+        match specified {
+            SpecifiedWalk::SampleLevel(sample) => &self.sample == sample,
+            SpecifiedWalk::HaplotypeLevel(sample, haplotype) => {
+                &self.sample == sample && &self.haplotype == haplotype
+            }
+            SpecifiedWalk::SequenceLevel(sample, haplotype, sequence) => {
+                &self.sample == sample && &self.haplotype == haplotype && &self.sequence == sequence
+            }
+            SpecifiedWalk::CoordLevel(sample, haplotype, sequence, start, end) => {
+                if let (Some(self_start), Some(self_end)) = (self.start.as_ref(), self.end.as_ref())
+                {
+                    &self.sample == sample
+                        && &self.haplotype == haplotype
+                        && &self.sequence == sequence
+                        && self_start == start
+                        && self_end == end
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+impl TryFrom<&str> for SpecifiedWalk {
+    type Error = anyhow::Error;
+    fn try_from(value: &str) -> anyhow::Result<Self> {
+        let fields: Vec<&str> = value.trim().split_whitespace().collect();
+        match fields.len() {
+            1 => Ok(Self::SampleLevel(fields[0].to_owned())),
+            2 => Ok(Self::HaplotypeLevel(
+                fields[0].to_owned(),
+                fields[1].parse()?,
+            )),
+            3 => Ok(Self::SequenceLevel(
+                fields[0].to_owned(),
+                fields[1].parse()?,
+                fields[2].to_owned(),
+            )),
+            5 => Ok(Self::CoordLevel(
+                fields[0].to_owned(),
+                fields[1].parse()?,
+                fields[2].to_owned(),
+                fields[3].parse()?,
+                fields[4].parse()?,
+            )),
+            _ => Err(anyhow!("Line {} does not follow path structure", value)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
@@ -360,10 +511,39 @@ mod tests {
 
     #[test]
     fn test_get_paths() {
-        let paths = vec!["P\tp1\t1+, 2-, 3+", "P\tp2\t2+, 4-", "P\tp3\t5-, 3-, 1+"];
-        let paths_to_keep = vec!["p2".to_string(), "p3".to_string()];
-        let calculated = get_paths(paths, paths_to_keep);
-        let expected = vec!["P\tp2\t2+, 4-".to_string(), "P\tp3\t5-, 3-, 1+".to_string()];
+        let paths = vec![
+            "P\tp1#0#a\t1+, 2-, 3+",
+            "P\tp2#0#a\t2+, 4-",
+            "P\tp3#0#a\t5-, 3-, 1+",
+        ];
+        let paths_to_keep = Some(vec![
+            SpecifiedWalk::SampleLevel("p2".to_string()),
+            SpecifiedWalk::SampleLevel("p3".to_string()),
+        ]);
+        let calculated = get_paths(paths, &paths_to_keep);
+        let expected = vec![
+            "P\tp2#0#a\t2+, 4-".to_string(),
+            "P\tp3#0#a\t5-, 3-, 1+".to_string(),
+        ];
+        assert_eq!(calculated, expected);
+    }
+
+    #[test]
+    fn test_get_walks() {
+        let paths = vec![
+            "W\tp1\t0\ta\t*\t*\t1+, 2-, 3+",
+            "W\tp2\t0\ta\t*\t*\t2+, 4-",
+            "W\tp3\t0\ta\t*\t*\t5-, 3-, 1+",
+        ];
+        let paths_to_keep = Some(vec![
+            SpecifiedWalk::SampleLevel("p2".to_string()),
+            SpecifiedWalk::SampleLevel("p3".to_string()),
+        ]);
+        let calculated = get_walks(paths, &paths_to_keep);
+        let expected = vec![
+            "W\tp2\t0\ta\t*\t*\t2+, 4-".to_string(),
+            "W\tp3\t0\ta\t*\t*\t5-, 3-, 1+".to_string(),
+        ];
         assert_eq!(calculated, expected);
     }
 
